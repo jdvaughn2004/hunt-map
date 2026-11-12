@@ -1,0 +1,162 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#121614">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<link rel="manifest" href="manifest.json">
+<link rel="apple-touch-icon" href="icon-192.png">
+<title>Hunt Map</title>
+<link rel="stylesheet" href="vendor/leaflet.css">
+<link rel="stylesheet" href="styles.css">
+<script src="vendor/leaflet.js"></script>
+<script src="vendor/suncalc.js"></script>
+<script src="vendor/togeojson.umd.js"></script>
+<script src="vendor/shp.js"></script>
+</head>
+<body>
+<div id="map"></div>
+
+<!-- ===== MAP OVERLAY ===== -->
+<div id="mapUI">
+  <div id="top" class="glass">
+    <svg id="topArrow" viewBox="0 0 100 100"></svg>
+    <div id="topText">
+      <div id="topWind">Wind: loading…</div>
+      <div id="topLegal"></div>
+      <div id="topParcel"></div>
+    </div>
+  </div>
+  <div id="fabs">
+    <button id="bLocate" class="glass" title="My location"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="4"/><path d="M12 2v4M12 18v4M2 12h4M18 12h4"/></svg></button>
+    <button id="bLayers" class="glass" title="Map layers"><svg viewBox="0 0 24 24"><path d="M12 3l9 5-9 5-9-5z"/><path d="M3 13l9 5 9-5"/></svg></button>
+    <button id="bAddPin" class="fab-primary" title="Add pin"><svg viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg></button>
+  </div>
+  <div id="zoomHint" class="glass small"></div>
+</div>
+
+<div id="layerMenu" class="sheet-pop">
+  <div class="pop-title">Map style</div>
+  <div class="seg" id="baseSeg">
+    <button data-base="hd">Satellite HD</button>
+    <button data-base="hdroads">Sat + Roads</button>
+    <button data-base="topo">Topo</button>
+    <button data-base="usgs">USGS Aerial</button>
+  </div>
+  <div class="small muted" id="baseNote" style="margin:6px 2px 10px"></div>
+  <label class="tog"><span>Property lines</span><input type="checkbox" id="chkParcels"></label>
+  <label class="tog"><span>Pin names</span><input type="checkbox" id="chkLabels"></label>
+  <label class="tog"><span>Scent cone</span><input type="checkbox" id="chkCone"></label>
+  <label class="tog"><span>Cone length</span><select id="coneLen"><option value="100">100 yd</option><option value="200">200 yd</option><option value="300">300 yd</option><option value="500">500 yd</option></select></label>
+</div>
+
+<!-- pin drop -->
+<svg id="cross" viewBox="0 0 44 44"><circle cx="22" cy="22" r="8" fill="none" stroke="#f26b1d" stroke-width="2.5"/><path d="M22 2v12M22 30v12M2 22h12M30 22h12" stroke="#fff" stroke-width="2"/></svg>
+<div id="dropPanel" class="sheet-pop">
+  <div class="row" style="justify-content:space-between"><div class="pop-title" style="margin:0">Pick a pin type, then center the crosshair</div></div>
+  <div id="typeGrid"></div>
+  <div class="row" style="margin-top:10px"><button id="bDropCancel" class="btn">Cancel</button><button id="bDropHere" class="btn primary" style="flex:2">Drop here</button></div>
+</div>
+
+<!-- ===== PAGES ===== -->
+<section class="page" id="pg-cams">
+  <header class="ph"><h1 id="camsTitle">Cameras</h1><div class="ph-act" id="camsActions"></div></header>
+  <div class="pbody" id="camsBody"></div>
+</section>
+
+<section class="page" id="pg-activity">
+  <header class="ph"><h1>Activity</h1></header>
+  <div class="pbody">
+    <div class="filters">
+      <select id="fCam"></select>
+      <select id="fSpecies"></select>
+      <select id="fPeriod"><option value="0">All time</option><option value="14">Last 14 days</option><option value="30">Last 30 days</option><option value="90">Last 90 days</option></select>
+    </div>
+    <div id="actBody"></div>
+  </div>
+</section>
+
+<section class="page" id="pg-weather">
+  <header class="ph"><h1>Weather</h1><div class="ph-act"><button class="btn sm" id="bWxRefresh">↻ Refresh</button></div></header>
+  <div class="pbody" id="wxBody"></div>
+</section>
+
+<section class="page" id="pg-more">
+  <header class="ph"><h1>More</h1></header>
+  <div class="pbody">
+    <div class="card" id="landHereCard" style="display:none"></div>
+    <div class="card">
+      <h3>County property lines</h3>
+      <div class="small muted" style="margin-bottom:8px">These load on their own as you zoom in, whenever you have signal. Anywhere you've looked stays on your phone for offline use. Save a whole county before you head out.</div>
+      <div class="list" id="srcList"></div>
+    </div>
+    <div class="card">
+      <h3>Your own parcel files</h3>
+      <div class="small muted" id="parcelStatus">No extra files loaded.</div>
+      <div class="row" style="margin-top:8px">
+        <button class="btn primary" id="bLoadParcels">Load parcel file</button>
+        <button class="btn" id="bClearParcels">Clear</button>
+        <input type="file" id="fParcels" accept=".geojson,.json,.kml,.zip" hidden>
+      </div>
+      <input id="ownerSearch" placeholder="Search owners in loaded parcels" style="margin-top:10px">
+      <div class="list" id="ownerResults"></div>
+      <div class="small muted" style="margin-top:8px">GeoJSON, KML, or a zipped shapefile (with its .prj). Files stay on this phone. Tax lines are approximate. The deed, the plat, and a survey are what legally count.</div>
+    </div>
+    <div class="card">
+      <h3>Pins</h3>
+      <div class="list" id="pinList"></div>
+    </div>
+    <div class="card">
+      <h3>Offline map</h3>
+      <div class="kv" id="offStatus"></div>
+      <div class="small muted" style="margin:8px 0">Saves USGS aerial and topo for the area on the map. Do it on WiFi. When you lose signal the map switches to the saved aerial on its own.</div>
+      <div class="row"><label class="small">Detail to <select id="dlMaxZ"><option value="15">zoom 15</option><option value="16" selected>zoom 16</option></select></label><span class="small muted" id="dlEstimate"></span></div>
+      <div class="row" style="margin-top:8px"><button class="btn primary" id="bDownload">Save map area</button><button class="btn" id="bClearTiles">Clear saved map</button></div>
+      <progress id="dlProg" value="0" max="1" style="display:none"></progress>
+      <div class="small muted" id="dlMsg"></div>
+    </div>
+    <div class="card">
+      <h3>Backup</h3>
+      <div class="small muted">Saves your pins and photo tags to a file. The photos themselves stay on the phone.</div>
+      <div class="row" style="margin-top:8px"><button class="btn" id="bExport">Export backup</button><button class="btn" id="bImportBtn">Import</button><input type="file" id="fImport" accept=".json" hidden></div>
+    </div>
+    <div class="card">
+      <div class="row" style="justify-content:space-between"><div>App version <b id="appVer">—</b></div><button class="btn sm" id="bCheckUpd">Check for update</button></div>
+      <div class="small muted" id="updMsg" style="margin-top:6px">Updates install on their own when you have signal. Your pins, photos, and saved map are kept.</div>
+    </div>
+    <div class="card small">
+      <h3>Links</h3>
+      <div class="list">
+        <a href="https://qpublic.schneidercorp.com/" target="_blank" rel="noopener">qPublic: county tax records</a>
+        <a href="https://app.regrid.com/us" target="_blank" rel="noopener">Regrid owner map</a>
+        <a href="https://eregulations.com/georgia/hunting" target="_blank" rel="noopener">GA hunting regulations</a>
+        <a href="https://gooutdoorsgeorgia.com/" target="_blank" rel="noopener">Go Outdoors GA: licenses &amp; Game Check</a>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- photo viewer -->
+<div id="viewer">
+  <div class="vtop"><button class="btn sm" id="vClose">✕</button><div id="vTitle" class="small"></div><button class="btn sm" id="vDel">Delete</button></div>
+  <div class="vimg"><img id="vImg" alt=""><button class="vnav" id="vPrev">‹</button><button class="vnav" id="vNext">›</button></div>
+  <div class="vbot"><div id="vWx" class="small"></div><div class="chips" id="vTags"></div></div>
+</div>
+
+<nav id="nav">
+  <button data-page="map" class="on"><svg viewBox="0 0 24 24"><path d="M9 4L3 6v14l6-2 6 2 6-2V4l-6 2z"/><path d="M9 4v14M15 6v14"/></svg><span>Map</span></button>
+  <button data-page="cams"><svg viewBox="0 0 24 24"><rect x="4" y="5" width="16" height="15" rx="3"/><circle cx="12" cy="13" r="3.5"/><path d="M8 8h1"/></svg><span>Cameras</span></button>
+  <button data-page="activity"><svg viewBox="0 0 24 24"><path d="M4 20V10M10 20V4M16 20v-7M22 20H2"/></svg><span>Activity</span></button>
+  <button data-page="weather"><svg viewBox="0 0 24 24"><path d="M3 9h11a3 3 0 1 0-3-3M3 15h15a3 3 0 1 1-3 3M3 12h8"/></svg><span>Weather</span></button>
+  <button data-page="more"><svg viewBox="0 0 24 24"><circle cx="5" cy="12" r="1.5"/><circle cx="12" cy="12" r="1.5"/><circle cx="19" cy="12" r="1.5"/></svg><span>More</span></button>
+</nav>
+
+<input type="file" id="fPhotos" accept="image/*" multiple hidden>
+<div id="toast"></div>
+<div id="updBar"><span>✨ Hunt Map was updated</span><button class="btn primary sm" id="bReload">Reload</button></div>
+
+<script src="app.js"></script>
+</body>
+</html>
