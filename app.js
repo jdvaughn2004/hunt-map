@@ -1075,7 +1075,9 @@ async function checkUpdate(manual) {
 if ('serviceWorker' in navigator && (location.protocol === 'https:' || location.hostname === 'localhost')) {
   const hadController = !!navigator.serviceWorker.controller;
   navigator.serviceWorker.addEventListener('message', e => { if (e.data?.type === 'version') $('#appVer').textContent = e.data.version; });
-  navigator.serviceWorker.addEventListener('controllerchange', () => { askVersion(); if (hadController) $('#updBar').style.display = 'flex'; });
+  const bootAt = Date.now();
+  // A new version that arrives while the app is still opening reloads straight away; later ones ask first.
+  navigator.serviceWorker.addEventListener('controllerchange', () => { askVersion(); if (!hadController) return; if (Date.now() - bootAt < 10000) location.reload(); else $('#updBar').style.display = 'flex'; });
   navigator.serviceWorker.register('sw.js', {updateViaCache: 'none'}).then(r => { swReg = r; askVersion(); checkUpdate(false); }).catch(() => {});
   document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') checkUpdate(false); });
   setInterval(() => checkUpdate(false), 30 * 60000);
