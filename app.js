@@ -440,14 +440,30 @@ const PARCEL_SOURCES = [
    fields: 'FID,PIN,ACRE_CALC,ACRE_DEEDE,CLASS', bbox: [-84.74, 33.74, -84.37, 34.09], minZoom: 15, cell: 0.008, download: false,
    map: p => ({Owner: null, 'Parcel ID': clean(p.PIN), Acres: p.ACRE_DEEDE || p.ACRE_CALC || null, Class: clean(p.CLASS)})},
 ];
+/* counties added from the in-app finder */
+const FRX = {owner: /owner|ownnam|own_name|lastname|taxpayer|grantee|^name1$/i, acres: /acre|acrg|^ac$|calc_?ac|gisac|deedac/i,
+  id: /^(pin|apn|parcel|parcelid|parcel_id|parcelno|parcel_no|parcelnum|parcel_num|realkey|pid|parno|map_?parcel)$/i, addr: /situs|^address$|prop_?addr|propertyaddress|location|site_?addr|parceladdr/i};
+const FSKIP = {owner: /occ|type|class|code|addr|mail|city|state|zip|count|num|date|_id$|flag|pct/i, acres: /cover|crop|adjacent|contig/i};
+const FEXACT = {owner: ['OWNER', 'OWNERNAME', 'OWNER_NAME', 'OWNERNME1', 'OWNER1', 'OWNER_1', 'OWN_NAME', 'OWNNAME', 'OWNNAM', 'LASTNAME', 'TAXPAYER', 'NAME1', 'GRANTEE', 'OWNERS']};
+function makeCustom(c) {
+  return Object.assign({}, c, {map: p => {
+    const o = {Owner: c.f.owner ? clean(p[c.f.owner]) : null, 'Parcel ID': c.f.id ? clean(p[c.f.id]) : null, Acres: c.f.acres ? p[c.f.acres] : null, Address: c.f.addr ? clean(p[c.f.addr]) : null};
+    const used = Object.values(c.f);
+    for (const [k, v] of Object.entries(p)) if (!/^(shape|objectid|fid$|globalid)/i.test(k) && v != null && v !== '' && !used.includes(k)) o[k] = v;
+    return o;
+  }});
+}
+ls.get('customSrc', []).forEach(c => PARCEL_SOURCES.push(makeCustom(c)));
 const LIVE = {}; // id -> {feat: Map, cells: Set, done, layer}
 const liveIndex = [];
-PARCEL_SOURCES.forEach(src => {
+function initLive(src) {
   LIVE[src.id] = {feat: new Map(), cells: new Set(), done: false, layer: L.geoJSON(null, {
     style: {color: '#ffd400', weight: 2, opacity: .95, fillColor: '#ffd400', fillOpacity: .03},
-    onEachFeature: (f, l) => { l.bindPopup(() => parcelPopup(f)); liveIndex.push({f, l}); }
+    onEachFeature: (f, l) => { l.bindPopup(() => parcelPopup(f)); liveIndex.push({f, l, src: src.id}); }
   })};
-});
+  LIVE[src.id].layer.addTo(parcelLayer);
+}
+PARCEL_SOURCES.forEach(initLive);
 const allParcels = () => liveIndex.concat(fileIndex);
 function addLive(src, feats, cached) {
   const st = LIVE[src.id], fresh = [];
@@ -512,8 +528,79 @@ function renderSources() {
   box.innerHTML = PARCEL_SOURCES.map(src => { const st = LIVE[src.id];
     return `<div class="camrow" style="cursor:default;padding:9px 10px"><div class="grow"><div class="nm">${src.name}</div>
       <div class="small muted">${src.by}</div><div class="small">${st.feat.size.toLocaleString()} parcels on this phone${st.done ? ' · <span class="good">whole county saved ✔</span>' : ''}</div></div>
-      ${src.download && !st.done ? `<button class="btn sm" data-save="${src.id}">Save county</button>` : ''}</div>`; }).join('');
+      <div style="display:flex;flex-direction:column;gap:6px">${src.download && !st.done ? `<button class="btn sm" data-save="${src.id}">Save county</button>` : ''}${src.custom ? `<button class="btn sm" data-rm="${src.id}">Remove</button>` : ''}</div></div>`; }).join('');
   box.querySelectorAll('[data-save]').forEach(b => b.onclick = () => saveCounty(PARCEL_SOURCES.find(s => s.id === b.dataset.save), b));
+  box.querySelectorAll('[data-rm]').forEach(b => b.onclick = () => removeSource(b.dataset.rm));
+}
+function removeSource(id) {
+  const i = PARCEL_SOURCES.findIndex(s => s.id === id); if (i < 0) return;
+  PARCEL_SOURCES.splice(i, 1);
+  parcelLayer.removeLayer(LIVE[id].layer); delete LIVE[id];
+  for (let k = liveIndex.length - 1; k >= 0; k--) if (liveIndex[k].src === id) liveIndex.splice(k, 1);
+  ls.set('customSrc', ls.get('customSrc', []).filter(c => c.id !== id));
+  idbReq('kv', 'readwrite', t => { t.objectStore('kv').delete('live:' + id); }).catch(() => {});
+  renderSources(); updateParcelHere(); zoomHint();
+}
+
+/* Find free public parcel layers for any county (searches ArcGIS Online's public catalog) */
+let findCands = [];
+async function findCounty() {
+  const raw = $('#findCounty').value.trim(), box = $('#findResults');
+  if (raw.length < 3) return toast('Type a county name');
+  if (!navigator.onLine) return toast('Needs signal');
+  const name = raw.replace(/\s*county\s*/i, ' ').trim();
+  box.innerHTML = '<div class="small muted">Searching public map layers… (10–20 seconds)</div>';
+  const J = u => fetch(u).then(r => r.json());
+  const seen = new Set(), items = [];
+  for (const q of [`${name} parcels`, `${name} county tax parcels`, `${name} GA parcels`]) {
+    try {
+      const j = await J('https://www.arcgis.com/sharing/rest/search?f=json&num=40&q=' + encodeURIComponent(q + ' type:"Feature Service" access:public'));
+      for (const it of j.results || []) if (it.url && !seen.has(it.url)) { seen.add(it.url); items.push(it); }
+    } catch (e) {}
+  }
+  const key = name.toLowerCase();
+  const rel = items.filter(it => [it.title, it.snippet, it.name, (it.tags || []).join(' ')].join(' ').toLowerCase().includes(key)).slice(0, 14);
+  const cands = [];
+  await Promise.all(rel.map(async it => {
+    try {
+      const base = it.url.replace(/\/$/, '');
+      const svc = await J(base + '?f=json');
+      for (const l of (svc.layers || []).slice(0, 8)) {
+        if (l.geometryType && l.geometryType !== 'esriGeometryPolygon') continue;
+        const u = base + '/' + l.id, info = await J(u + '?f=json');
+        if (info.geometryType !== 'esriGeometryPolygon') continue;
+        const names = (info.fields || []).map(f => f.name);
+        const pf = k => (FEXACT[k] && names.find(n => FEXACT[k].includes(n.toUpperCase()))) || names.find(n => FRX[k].test(n) && !(FSKIP[k] && FSKIP[k].test(n))) || null;
+        const f = {owner: pf('owner'), acres: pf('acres'), id: pf('id'), addr: pf('addr')};
+        if (!f.id && !f.owner && !f.acres) continue;
+        const [cnt, ext] = await Promise.all([J(u + '/query?where=1%3D1&returnCountOnly=true&f=json'), J(u + '/query?where=1%3D1&returnExtentOnly=true&outSR=4326&f=json')]);
+        const e = ext.extent; if (!e || !isFinite(e.xmin) || !cnt.count) continue;
+        let sample = [];
+        if (f.owner) { const sm = await J(u + `/query?where=1%3D1&outFields=${encodeURIComponent(f.owner)}&returnGeometry=false&resultRecordCount=6&f=json`); sample = (sm.features || []).map(x => clean(x.attributes[f.owner])).filter(v => v && v.length > 3 && /[a-z]{2}/i.test(v)).slice(0, 2); if (!sample.length) f.owner = null; }
+        cands.push({title: it.title, pub: it.owner, url: u, count: cnt.count, f, bbox: [e.xmin, e.ymin, e.xmax, e.ymax], edited: info.editingInfo?.lastEditDate || it.modified, sample});
+      }
+    } catch (e) {}
+  }));
+  cands.sort((a, b) => (!!b.sample.length - !!a.sample.length) || (!!b.f.owner - !!a.f.owner) || (b.edited - a.edited));
+  findCands = cands;
+  if (!cands.length) { box.innerHTML = `<div class="small muted">No free public parcel layer found for "${esc(raw)}". You can still load a purchased county file below.</div>`; return; }
+  box.innerHTML = cands.slice(0, 8).map((c, i) => `<div class="camrow" style="cursor:default;padding:9px 10px;align-items:flex-start"><div class="grow">
+      <div class="nm">${esc(c.title)}</div><div class="small muted">by ${esc(c.pub)} · ${c.count.toLocaleString()} parcels${c.edited ? ' · updated ' + new Date(c.edited).toLocaleDateString([], {month: 'short', year: 'numeric'}) : ''}</div>
+      <div class="small">${c.sample.length ? `<span class="good">Owner names ✓</span> <span class="muted">e.g. ${esc(c.sample[0])}</span>` : '<span class="warn">Lines only, no owner names</span>'}</div></div>
+      <button class="btn sm primary" data-use="${i}">Use</button></div>`).join('') +
+    '<div class="small muted">These are layers that counties, regional commissions, and others have shared publicly. Pick the newest one with owner names. After you add it, the map jumps there so you can check it covers the right area.</div>';
+  box.querySelectorAll('[data-use]').forEach(b => b.onclick = () => useCand(findCands[+b.dataset.use], raw));
+}
+function useCand(c, label) {
+  const area = Math.max((c.bbox[2] - c.bbox[0]) * (c.bbox[3] - c.bbox[1]), 0.005), dense = c.count / area > 300000;
+  const nm = /county/i.test(label) ? label.replace(/\b\w/g, ch => ch.toUpperCase()) : label.replace(/\b\w/g, ch => ch.toUpperCase()) + ' County';
+  const cfg = {id: 'c_' + uid(), name: nm, by: c.pub, url: c.url, fields: '*', bbox: c.bbox, minZoom: dense ? 15 : 13, cell: dense ? 0.008 : 0.03, download: c.count <= 30000, f: c.f, custom: true};
+  ls.set('customSrc', [...ls.get('customSrc', []), cfg]);
+  const src = makeCustom(cfg); PARCEL_SOURCES.push(src); initLive(src);
+  $('#findResults').innerHTML = ''; $('#findCounty').value = '';
+  renderSources(); showPage('map');
+  map.fitBounds([[c.bbox[1], c.bbox[0]], [c.bbox[3], c.bbox[2]]]);
+  toast(`${nm} added. Zoom in to see property lines.`, 4000);
 }
 map.on('moveend', () => loadLiveParcels());
 
@@ -543,7 +630,6 @@ function parcelPopup(f) {
 }
 let fileIndex = [];
 const fileGroup = L.layerGroup().addTo(parcelLayer);
-PARCEL_SOURCES.forEach(src => LIVE[src.id].layer.addTo(parcelLayer));
 function buildParcelLayer() {
   fileGroup.clearLayers(); fileIndex = [];
   S.parcelSets.forEach(set => L.geoJSON(set.fc, {
@@ -577,6 +663,8 @@ function normalizeFC(gj) {
   return gj;
 }
 $('#bLoadParcels').onclick = () => $('#fParcels').click();
+$('#bFindCounty').onclick = findCounty;
+$('#findCounty').addEventListener('keydown', e => { if (e.key === 'Enter') findCounty(); });
 $('#fParcels').onchange = async e => {
   const f = e.target.files[0]; if (!f) return; e.target.value = '';
   $('#parcelStatus').textContent = 'Reading ' + f.name + '…';
