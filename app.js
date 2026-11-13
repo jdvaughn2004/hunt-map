@@ -1146,7 +1146,10 @@ sq.addEventListener('input', () => {
   const local = q.length >= 3 ? localOwnerHits(ql) : [];
   renderSugg(local, [], q.length >= 3 && navigator.onLine);
   clearTimeout(suggT);
-  if (q.length >= 3) suggT = setTimeout(async () => { const r = await remoteOwnerHits(q, seq); if (r) { suggOwners = r; renderSugg(local, r, false); } }, 400);
+  if (q.length >= 3) suggT = setTimeout(async () => { let r = await remoteOwnerHits(q, seq); if (r) {
+    const have = new Set(local.map(x => (x.s.owner + '|' + (x.s.id || '')).toUpperCase()));
+    r = r.filter(x => !have.has((x.owner + '|' + (x.pid || '')).toUpperCase())); // already listed under loaded parcels
+    suggOwners = r; renderSugg(local, r, false); } }, 400);
 });
 sq.addEventListener('focus', () => { if (sq.value.trim().length >= 2) sq.dispatchEvent(new Event('input')); });
 sq.addEventListener('keydown', e => { if (e.key === 'Enter') { const first = sugg.querySelector('.sg'); if (first) first.click(); } if (e.key === 'Escape') doneSearch(); });
