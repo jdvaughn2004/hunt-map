@@ -174,6 +174,7 @@ function zoomHint_() {
   const b = map.getBounds(), needZoom = S.showParcels && PARCEL_SOURCES.find(src => !LIVE[src.id]?.done && bboxHits(b, src.bbox) && z < src.minZoom);
   if (z > nz + 0.5) { el.textContent = `Max detail for ${BASES[S.base].name}. Try Satellite HD.`; el.style.display = 'block'; }
   else if (needZoom) { el.textContent = `Zoom in to load ${needZoom.name} property lines`; el.style.display = 'block'; }
+  else if (S.showParcels && z >= 12 && (() => { const c = countyOf(map.getCenter().lat, map.getCenter().lng); return c && !srcForCounty(c) && (el.textContent = `No free property lines for ${c.n} County yet`); })()) el.style.display = 'block';
   else el.style.display = 'none';
 }
 map.on('moveend', () => zoomHint());
@@ -434,21 +435,10 @@ const clean = v => v == null ? null : String(v).replace(/\s+/g, ' ').trim() || n
 function landCover(js) {
   try { const o = JSON.parse(js); return Object.entries(o).sort((a, b) => b[1] - a[1]).slice(0, 3).map(([k, v]) => `${k} ${v} ac`).join(', '); } catch (e) { return null; }
 }
-const PARCEL_SOURCES = [
-  {id: 'twiggs', name: 'Twiggs County', by: 'Middle Georgia Regional Commission',
-   url: 'https://services1.arcgis.com/Ug5xGQbHsD8zuZzM/arcgis/rest/services/Twiggs_County_Parcels/FeatureServer/0',
-   fields: 'OBJECTID,PARCEL_NO,LASTNAME,TOTALACRES_1,ADDRESS,CURR_VAL', bbox: [-83.611, 32.452, -83.232, 32.898], minZoom: 13, cell: 0.03, download: true,
-   map: p => ({Owner: clean(p.LASTNAME), 'Parcel ID': clean(p.PARCEL_NO), Acres: p.TOTALACRES_1, Address: clean(p.ADDRESS), 'Assessed value': p.CURR_VAL != null ? '$' + Number(p.CURR_VAL).toLocaleString() : null})},
-  {id: 'wilkinson', name: 'Wilkinson County', by: 'public ArcGIS layer (2025 tax data)',
-   url: 'https://services1.arcgis.com/ue5fMdTkPeHLCobS/arcgis/rest/services/Wilkinson_GA_gdb/FeatureServer/0',
-   fields: 'OBJECTID,ParcelID,OwnerName,DeededAcres,GISAcres,PropertyAddress,MailAddressLine1,MailCityStateZIP,LegalDescription,LandCoverAcres', bbox: [-83.41, 32.579, -82.945, 33.009], minZoom: 13, cell: 0.03, download: true,
-   map: p => ({Owner: clean(p.OwnerName), 'Parcel ID': clean(p.ParcelID), Acres: p.DeededAcres ?? (p.GISAcres != null ? +(+p.GISAcres).toFixed(1) : null), Address: clean(p.PropertyAddress),
-     'Owner mailing': [p.MailAddressLine1, p.MailCityStateZIP].filter(Boolean).join(', ') || null, Legal: clean(p.LegalDescription), 'Land cover': landCover(p.LandCoverAcres)})},
-  {id: 'cobb', name: 'Cobb County', by: 'public ArcGIS layer (lines only, no owner names)',
-   url: 'https://services.arcgis.com/HYLRafMc4Ux6DA8c/arcgis/rest/services/CobbParcels/FeatureServer/0',
-   fields: 'FID,PIN,ACRE_CALC,ACRE_DEEDE,CLASS', bbox: [-84.74, 33.74, -84.37, 34.09], minZoom: 15, cell: 0.008, download: false,
-   map: p => ({Owner: null, 'Parcel ID': clean(p.PIN), Acres: p.ACRE_DEEDE || p.ACRE_CALC || null, Class: clean(p.CLASS)})},
-];
+/* Statewide catalog (counties.js): the best free public parcel layer found for each Georgia county. */
+const GA = (window.GA_COUNTIES || []);
+const PARCEL_SOURCES = [];
+const LEGACY = {twiggs: '13289', wilkinson: '13319', cobb: '13067'}; // ids used before the catalog existed
 /* counties added from the in-app finder */
 const FRX = {owner: /owner|ownnam|own_name|lastname|taxpayer|grantee|^name1$/i, acres: /acre|acrg|^ac$|calc_?ac|gisac|deedac/i,
   id: /^(pin|apn|parcel|parcelid|parcel_id|parcelno|parcel_no|parcelnum|parcel_num|realkey|pid|parno|map_?parcel)$/i, addr: /situs|^address$|prop_?addr|propertyaddress|location|site_?addr|parceladdr/i};
@@ -458,11 +448,33 @@ function makeCustom(c) {
   return Object.assign({}, c, {map: p => {
     const o = {Owner: c.f.owner ? clean(p[c.f.owner]) : null, 'Parcel ID': c.f.id ? clean(p[c.f.id]) : null, Acres: c.f.acres ? p[c.f.acres] : null, Address: c.f.addr ? clean(p[c.f.addr]) : null};
     const used = Object.values(c.f);
-    for (const [k, v] of Object.entries(p)) if (!/^(shape|objectid|fid$|globalid)/i.test(k) && v != null && v !== '' && !used.includes(k)) o[k] = v;
+    for (const [k, v] of Object.entries(p)) if (!/^(shape|objectid|fid$|globalid|landcoveracres|cropcoveracres)/i.test(k) && v != null && v !== '' && !used.includes(k)) o[k] = v;
+    if (p.LandCoverAcres) o['Land cover'] = landCover(p.LandCoverAcres);
     return o;
   }});
 }
-ls.get('customSrc', []).forEach(c => PARCEL_SOURCES.push(makeCustom(c)));
+// Catalog counties become live sources; a county's density decides how far you must zoom in.
+const byUrl = new Map();
+GA.forEach(c => {
+  if (!c.s) return;
+  const s = c.s;
+  if (byUrl.has(s.u)) { byUrl.get(s.u).counties.push(c.n); return; } // one regional layer can cover several counties
+  const lb = s.b || c.b, area = Math.max((lb[2] - lb[0]) * (lb[3] - lb[1]), 0.01), dense = s.c / area > 300000;
+  const src = makeCustom({id: 'ga' + c.fips, fips: c.fips, counties: [c.n], name: c.n + ' County', by: s.p, url: s.u, kind: s.gj ? 'geojson' : 'json', oid: s.o,
+    fields: '*', bbox: lb, f: s.f, count: s.c, edited: s.e, minZoom: dense ? 15 : 13, cell: dense ? 0.008 : 0.03, download: s.c <= 30000, catalog: true});
+  byUrl.set(s.u, src); PARCEL_SOURCES.push(src);
+});
+byUrl.forEach(src => { if (src.counties.length > 1) src.name = src.counties.map(n => n).join(' / ') + ' Counties'; });
+const LEGACY_URL = {twiggs: 'Twiggs_County_Parcels/FeatureServer/0', wilkinson: 'Wilkinson_GA_gdb/FeatureServer/0', cobb: 'CobbParcels/FeatureServer/0'};
+{ // layers added with the finder that the catalog now covers would load twice, so drop them
+  const cs = ls.get('customSrc', []), keep = cs.filter(c => !byUrl.has(c.url));
+  if (keep.length !== cs.length) ls.set('customSrc', keep);
+  keep.forEach(c => PARCEL_SOURCES.push(makeCustom(c)));
+}
+const countyOf = (lat, lon) => {
+  const pt = [lon, lat];
+  return GA.find(c => c.g && lon >= c.b[0] && lon <= c.b[2] && lat >= c.b[1] && lat <= c.b[3] && c.g.some(poly => inRing(pt, poly))) || null;
+};
 const LIVE = {}; // id -> {feat: Map, cells: Set, done, layer}
 const liveIndex = [];
 function initLive(src) {
@@ -478,7 +490,7 @@ function addLive(src, feats, cached) {
   const st = LIVE[src.id], fresh = [];
   for (const f of feats || []) {
     if (!f.geometry || !/Polygon/.test(f.geometry.type)) continue;
-    const id = f.id ?? f.properties?.OBJECTID ?? f.properties?.FID;
+    const id = f.id ?? (src.oid && f.properties?.[src.oid]) ?? f.properties?.OBJECTID ?? f.properties?.FID;
     if (id == null || st.feat.has(id)) continue;
     const nf = {type: 'Feature', id, geometry: f.geometry, properties: cached ? f.properties : Object.assign(src.map(f.properties || {}), {Source: `${src.name} · ${src.by}`})};
     st.feat.set(id, nf); fresh.push(nf);
@@ -491,13 +503,24 @@ function saveLive(src) {
   clearTimeout(saveLiveT[src.id]);
   saveLiveT[src.id] = setTimeout(() => { const st = LIVE[src.id]; kvSet('live:' + src.id, {features: [...st.feat.values()], cells: [...st.cells], done: st.done}).catch(() => {}); }, 1500);
 }
-const qGeo = (src, extra) => `${src.url}/query?outFields=${src.fields}&outSR=4326&f=geojson&geometryPrecision=6&maxAllowableOffset=0.000004&resultRecordCount=2000${extra}`;
+const qGeo = (src, extra) => `${src.url}/query?outFields=${src.fields}&outSR=4326&f=${src.kind === 'json' ? 'json' : 'geojson'}&geometryPrecision=6&maxAllowableOffset=0.000004&resultRecordCount=2000${extra}`;
+// Older map services only speak Esri JSON. Esri marks outer rings clockwise and holes counter-clockwise.
+function esriToGeo(j, oid) {
+  const signed = r => { let a = 0; for (let i = 0, k = r.length - 1; i < r.length; k = i++) a += (r[i][0] - r[k][0]) * (r[i][1] + r[k][1]); return a; };
+  return (j.features || []).map(ft => {
+    const rings = ft.geometry && ft.geometry.rings; if (!rings || !rings.length) return null;
+    const polys = [];
+    for (const r of rings) { if (signed(r) > 0 || !polys.length) polys.push([r]); else polys[polys.length - 1].push(r); }
+    const a = ft.attributes || {};
+    return {type: 'Feature', id: a[oid] ?? a.OBJECTID ?? a.FID, properties: a, geometry: polys.length === 1 ? {type: 'Polygon', coordinates: polys[0]} : {type: 'MultiPolygon', coordinates: polys}};
+  }).filter(Boolean);
+}
 async function fetchAll(src, extra, onPage) {
   let off = 0;
-  for (let guard = 0; guard < 200; guard++) {
+  for (let guard = 0; guard < 300; guard++) {
     const r = await fetch(qGeo(src, extra + `&resultOffset=${off}`)); if (!r.ok) throw new Error('HTTP ' + r.status);
     const j = await r.json(); if (j.error) throw new Error(j.error.message || 'service error');
-    const fs = j.features || []; addLive(src, fs); off += fs.length; onPage && onPage(off);
+    const fs = src.kind === 'json' ? esriToGeo(j, src.oid) : (j.features || []); addLive(src, fs); off += fs.length; onPage && onPage(off);
     if (!fs.length || !(j.exceededTransferLimit || j.properties?.exceededTransferLimit)) break;
   }
 }
@@ -534,10 +557,17 @@ async function saveCounty(src, btn) {
 }
 function renderSources() {
   const box = $('#srcList'); if (!box) return;
-  box.innerHTML = PARCEL_SOURCES.map(src => { const st = LIVE[src.id];
-    return `<div class="camrow" style="cursor:default;padding:9px 10px"><div class="grow"><div class="nm">${src.name}</div>
-      <div class="small muted">${src.by}</div><div class="small">${st.feat.size.toLocaleString()} parcels on this phone${st.done ? ' · <span class="good">whole county saved ✔</span>' : ''}</div></div>
-      <div style="display:flex;flex-direction:column;gap:6px">${src.download && !st.done ? `<button class="btn sm" data-save="${src.id}">Save county</button>` : ''}${src.custom ? `<button class="btn sm" data-rm="${src.id}">Remove</button>` : ''}</div></div>`; }).join('');
+  const withSrc = GA.filter(c => c.s), own = GA.filter(c => c.s && c.s.f.owner);
+  $('#catSummary').innerHTML = `Free property lines for <b>${withSrc.length} of ${GA.length}</b> Georgia counties (<b>${own.length}</b> with owner names). They load on their own as you zoom in. Anywhere you've looked stays on your phone for offline use. Save a whole county before you head out.`;
+  const here = countyOf(map.getCenter().lat, map.getCenter().lng), hereSrc = here && srcForCounty(here);
+  const show = PARCEL_SOURCES.filter(src => src === hereSrc || src.custom || LIVE[src.id]?.feat.size);
+  const row = src => { const st = LIVE[src.id];
+    return `<div class="camrow" style="cursor:default;padding:9px 10px"><div class="grow"><div class="nm">${esc(src.name)}${src === hereSrc ? ' <span class="badge" style="background:#1d3a2a;color:#9be3b5">ON MAP</span>' : ''}</div>
+      <div class="small muted">by ${esc(src.by)}${src.edited ? ' · updated ' + new Date(src.edited).toLocaleDateString([], {month: 'short', year: 'numeric'}) : ''}${src.f && !src.f.owner ? ' · lines only' : ''}</div>
+      <div class="small">${st.feat.size.toLocaleString()} parcels on this phone${st.done ? ' · <span class="good">whole county saved ✔</span>' : ''}</div></div>
+      <div style="display:flex;flex-direction:column;gap:6px">${src.download && !st.done ? `<button class="btn sm" data-save="${src.id}">Save county</button>` : ''}${src.custom ? `<button class="btn sm" data-rm="${src.id}">Remove</button>` : ''}</div></div>`; };
+  box.innerHTML = (here && !hereSrc ? `<div class="small warn">The map is on ${esc(here.n)} County, which has no free property lines yet. Try "Find another layer" below, or load a county file.</div>` : '') +
+    (show.length ? show.map(row).join('') : '<div class="small muted">Nothing saved yet. Pan to your land and zoom in.</div>');
   box.querySelectorAll('[data-save]').forEach(b => b.onclick = () => saveCounty(PARCEL_SOURCES.find(s => s.id === b.dataset.save), b));
   box.querySelectorAll('[data-rm]').forEach(b => b.onclick = () => removeSource(b.dataset.rm));
 }
@@ -1067,6 +1097,82 @@ $('#fImport').onchange = async e => {
   } catch (err) { toast('That file is not a Hunt Map backup'); }
 };
 
+/* ---------- map search: counties and owner names, with suggestions ---------- */
+const sq = $('#q'), sugg = $('#sugg');
+let suggT = null, suggSeq = 0, suggOwners = [];
+const srcForCounty = c => PARCEL_SOURCES.find(s => s.counties && s.counties.includes(c.n));
+function hideSugg() { sugg.style.display = 'none'; sugg.innerHTML = ''; }
+function suggRow(icon, main, sub, data) { return `<div class="sg" ${data}><span class="sgi">${icon}</span><div class="grow"><div class="nm">${main}</div>${sub ? `<div class="small muted">${sub}</div>` : ''}</div></div>`; }
+function renderSugg(local, remote, loading) {
+  const q = sq.value.trim(); if (q.length < 2) return hideSugg();
+  let h = '';
+  const ql = q.toLowerCase();
+  const cs = GA.filter(c => c.n.toLowerCase().startsWith(ql)).concat(GA.filter(c => !c.n.toLowerCase().startsWith(ql) && c.n.toLowerCase().includes(ql))).slice(0, 4);
+  if (cs.length) h += '<div class="sgh">Counties</div>' + cs.map(c => { const src = srcForCounty(c);
+    return suggRow('📍', esc(c.n) + ' County', src ? (src.f.owner ? 'Property lines + owner names' : 'Property lines only') : 'No free property lines yet', `data-county="${c.fips}"`); }).join('');
+  if (local.length) h += '<div class="sgh">Owners on loaded parcels</div>' + local.map((x, i) => suggRow('🏠', esc(x.s.owner), [x.s.acres != null ? esc(x.s.acres) + ' ac' : '', esc(x.s.id || '')].filter(Boolean).join(' · '), `data-local="${i}"`)).join('');
+  if (remote.length) h += '<div class="sgh">Owners nearby</div>' + remote.map((x, i) => suggRow('🔎', esc(x.owner), [esc(x.county), x.acres != null ? esc(x.acres) + ' ac' : '', esc(x.pid || '')].filter(Boolean).join(' · '), `data-remote="${i}"`)).join('');
+  if (loading) h += '<div class="sgh">Searching owners nearby…</div>';
+  if (!h) h = '<div class="sgh">No matches</div>';
+  sugg.innerHTML = h; sugg.style.display = 'block';
+  sugg.querySelectorAll('[data-county]').forEach(el => el.onclick = () => goCounty(GA.find(c => c.fips === el.dataset.county)));
+  sugg.querySelectorAll('[data-local]').forEach(el => el.onclick = () => { const x = local[+el.dataset.local]; doneSearch(); map.fitBounds(x.l.getBounds(), {maxZoom: 17}); setTimeout(() => x.l.openPopup(x.l.getBounds().getCenter()), 350); });
+  sugg.querySelectorAll('[data-remote]').forEach(el => el.onclick = () => goRemote(remote[+el.dataset.remote]));
+}
+function localOwnerHits(ql) {
+  const out = [], seen = new Set();
+  for (const x of allParcels()) { const s = parcelSummary(x.f); if (s.owner && s.owner.toLowerCase().includes(ql) && !seen.has(s.owner + s.id)) { seen.add(s.owner + s.id); out.push({x, s, l: x.l}); if (out.length >= 5) break; } }
+  return out;
+}
+// Ask the county servers near the map for owners matching the text (works for parcels you haven't loaded yet).
+async function remoteOwnerHits(q, seq) {
+  if (!navigator.onLine) return [];
+  const c = map.getCenter(), b = map.getBounds().pad(0.6);
+  const srcs = PARCEL_SOURCES.filter(src => src.f && src.f.owner && bboxHits(b, src.bbox))
+    .sort((a, z) => Math.hypot((a.bbox[0] + a.bbox[2]) / 2 - c.lng, (a.bbox[1] + a.bbox[3]) / 2 - c.lat) - Math.hypot((z.bbox[0] + z.bbox[2]) / 2 - c.lng, (z.bbox[1] + z.bbox[3]) / 2 - c.lat)).slice(0, 5);
+  const like = q.toUpperCase().replace(/'/g, "''").replace(/[%_]/g, '');
+  const res = await Promise.all(srcs.map(async src => {
+    try {
+      const flds = [src.oid || 'OBJECTID', src.f.owner, src.f.acres, src.f.id].filter(Boolean).join(',');
+      const u = `${src.url}/query?where=${encodeURIComponent(`UPPER(${src.f.owner}) LIKE '%${like}%'`)}&outFields=${encodeURIComponent(flds)}&returnGeometry=false&resultRecordCount=6&f=json`;
+      const j = await fetch(u).then(r => r.json());
+      return (j.features || []).map(ft => ({src, oid: ft.attributes[src.oid || 'OBJECTID'], owner: clean(ft.attributes[src.f.owner]), acres: src.f.acres ? ft.attributes[src.f.acres] : null, pid: src.f.id ? clean(ft.attributes[src.f.id]) : null, county: src.name}));
+    } catch (e) { return []; }
+  }));
+  return seq === suggSeq ? res.flat().filter(x => x.owner).slice(0, 10) : null;
+}
+sq.addEventListener('input', () => {
+  const q = sq.value.trim(), ql = q.toLowerCase(), seq = ++suggSeq;
+  const local = q.length >= 3 ? localOwnerHits(ql) : [];
+  renderSugg(local, [], q.length >= 3 && navigator.onLine);
+  clearTimeout(suggT);
+  if (q.length >= 3) suggT = setTimeout(async () => { const r = await remoteOwnerHits(q, seq); if (r) { suggOwners = r; renderSugg(local, r, false); } }, 400);
+});
+sq.addEventListener('focus', () => { if (sq.value.trim().length >= 2) sq.dispatchEvent(new Event('input')); });
+sq.addEventListener('keydown', e => { if (e.key === 'Enter') { const first = sugg.querySelector('.sg'); if (first) first.click(); } if (e.key === 'Escape') doneSearch(); });
+$('#qClear').onclick = () => { sq.value = ''; hideSugg(); sq.blur(); };
+map.on('click', () => { hideSugg(); sq.blur(); });
+function doneSearch() { hideSugg(); sq.blur(); }
+function goCounty(c) {
+  doneSearch(); sq.value = c.n + ' County';
+  map.fitBounds([[c.b[1], c.b[0]], [c.b[3], c.b[2]]]);
+  const src = srcForCounty(c);
+  toast(src ? `${c.n} County: zoom in to see property lines` : `${c.n} County has no free property lines yet. See More → County property lines.`, 3500);
+}
+async function goRemote(x) {
+  doneSearch(); sq.value = x.owner;
+  try {
+    const u = `${x.src.url}/query?objectIds=${x.oid}&outFields=*&outSR=4326&f=${x.src.kind === 'json' ? 'json' : 'geojson'}`;
+    const j = await fetch(u).then(r => r.json());
+    const fs = x.src.kind === 'json' ? esriToGeo(j, x.src.oid) : (j.features || []);
+    addLive(x.src, fs); saveLive(x.src);
+    const id = fs[0] && (fs[0].id ?? fs[0].properties?.[x.src.oid]);
+    const hit = liveIndex.find(e => e.src === x.src.id && e.f.id === id);
+    if (hit) { map.fitBounds(hit.l.getBounds(), {maxZoom: 17}); setTimeout(() => hit.l.openPopup(hit.l.getBounds().getCenter()), 400); }
+    else toast('Could not load that parcel');
+  } catch (e) { toast('Could not load that parcel'); }
+}
+
 /* ---------- navigation ---------- */
 let curPage = 'map';
 function showPage(p) {
@@ -1118,7 +1224,11 @@ setBase(S.base);
 map.fire('zoomend');
 renderPins(); renderWx();
 kvGet('parcels').then(v => { if (Array.isArray(v)) S.parcelSets = v; buildParcelLayer(); }).catch(() => buildParcelLayer());
-Promise.all(PARCEL_SOURCES.map(src => kvGet('live:' + src.id).then(v => { if (v) { addLive(src, v.features, true); (v.cells || []).forEach(c => LIVE[src.id].cells.add(c)); LIVE[src.id].done = !!v.done; } }).catch(() => {})))
+Promise.all(PARCEL_SOURCES.map(src => kvGet('live:' + src.id).then(async v => {
+    const old = Object.keys(LEGACY).find(k => LEGACY[k] === src.fips && src.url.endsWith(LEGACY_URL[k]));
+    if (!v && old) v = await kvGet('live:' + old).catch(() => null); // carry over parcels saved by earlier versions
+    if (v) { addLive(src, v.features, true); (v.cells || []).forEach(c => LIVE[src.id].cells.add(c)); LIVE[src.id].done = !!v.done; }
+  }).catch(() => {})))
   .then(() => { loadLiveParcels(); zoomHint(); });
 photosAll().then(ps => { S.photos = ps || []; enrichWeather(); }).catch(() => {});
 startGPS();

@@ -1,9 +1,9 @@
 // Hunt Map service worker
 // Bump VERSION on every release: phones see the changed file, install it, and offer a reload.
-const VERSION = '2.3.0';
+const VERSION = '2.4.0';
 const APP = 'hm-app-' + VERSION;
 const TILES = 'hm-tiles';
-const SHELL = ['./', 'index.html', 'styles.css', 'app.js', 'manifest.json', 'icon-192.png', 'icon-512.png',
+const SHELL = ['./', 'index.html', 'styles.css', 'app.js', 'counties.js', 'manifest.json', 'icon-192.png', 'icon-512.png',
   'vendor/leaflet.js', 'vendor/leaflet.css', 'vendor/suncalc.js', 'vendor/togeojson.umd.js', 'vendor/shp.js'];
 
 self.addEventListener('install', e => {
