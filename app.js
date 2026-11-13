@@ -177,6 +177,15 @@ function zoomHint_() {
   else el.style.display = 'none';
 }
 map.on('moveend', () => zoomHint());
+// Thousands of parcel outlines are unreadable and heavy when zoomed far out, so hide them below zoom 11.
+const PARCEL_MIN_Z = 11;
+function syncParcelVisibility() { try { syncParcelVisibility_(); } catch (e) {} }
+function syncParcelVisibility_() {
+  const want = S.showParcels && map.getZoom() >= PARCEL_MIN_Z;
+  if (want && !map.hasLayer(parcelLayer)) parcelLayer.addTo(map);
+  if (!want && map.hasLayer(parcelLayer)) map.removeLayer(parcelLayer);
+}
+map.on('zoomend', () => syncParcelVisibility());
 map.on('zoomend', () => { zoomHint(); $('#map').classList.toggle('nolabels', !S.showLabels || map.getZoom() < 15); });
 map.on('moveend', () => { const c = map.getCenter(); ls.set('view', {c: [c.lat, c.lng], z: map.getZoom()}); updateDlEstimate(); });
 map.on('dragstart', () => { if (S.follow) { S.follow = false; $('#bLocate').classList.remove('on'); } });
@@ -552,7 +561,7 @@ async function findCounty() {
   box.innerHTML = '<div class="small muted">Searching public map layers… (10–20 seconds)</div>';
   const J = u => fetch(u).then(r => r.json());
   const seen = new Set(), items = [];
-  for (const q of [`${name} parcels`, `${name} county tax parcels`, `${name} GA parcels`]) {
+  for (const q of [`${name} parcels`, `${name} county tax parcels`, `${name} GA parcels`, `${name} County Georgia`]) {
     try {
       const j = await J('https://www.arcgis.com/sharing/rest/search?f=json&num=40&q=' + encodeURIComponent(q + ' type:"Feature Service" access:public'));
       for (const it of j.results || []) if (it.url && !seen.has(it.url)) { seen.add(it.url); items.push(it); }
@@ -565,9 +574,12 @@ async function findCounty() {
     try {
       const base = it.url.replace(/\/$/, '');
       const svc = await J(base + '?f=json');
-      for (const l of (svc.layers || []).slice(0, 8)) {
-        if (l.geometryType && l.geometryType !== 'esriGeometryPolygon') continue;
-        const u = base + '/' + l.id, info = await J(u + '?f=json');
+      // An item can point at a whole service (with a list of layers) or straight at one layer.
+      const layers = svc.layers ? svc.layers.slice(0, 8).map(l => ({u: base + '/' + l.id, gt: l.geometryType}))
+        : svc.geometryType ? [{u: base, gt: svc.geometryType, info: svc}] : [];
+      for (const l of layers) {
+        if (l.gt && l.gt !== 'esriGeometryPolygon') continue;
+        const u = l.u, info = l.info || await J(u + '?f=json');
         if (info.geometryType !== 'esriGeometryPolygon') continue;
         const names = (info.fields || []).map(f => f.name);
         const pf = k => (FEXACT[k] && names.find(n => FEXACT[k].includes(n.toUpperCase()))) || names.find(n => FRX[k].test(n) && !(FSKIP[k] && FSKIP[k].test(n))) || null;
@@ -577,14 +589,17 @@ async function findCounty() {
         const e = ext.extent; if (!e || !isFinite(e.xmin) || !cnt.count) continue;
         let sample = [];
         if (f.owner) { const sm = await J(u + `/query?where=1%3D1&outFields=${encodeURIComponent(f.owner)}&returnGeometry=false&resultRecordCount=6&f=json`); sample = (sm.features || []).map(x => clean(x.attributes[f.owner])).filter(v => v && v.length > 3 && /[a-z]{2}/i.test(v)).slice(0, 2); if (!sample.length) f.owner = null; }
-        cands.push({title: it.title, pub: it.owner, url: u, count: cnt.count, f, bbox: [e.xmin, e.ymin, e.xmax, e.ymax], edited: info.editingInfo?.lastEditDate || it.modified, sample});
+        const cx = (e.xmin + e.xmax) / 2, cy = (e.ymin + e.ymax) / 2, inGA = cx > -85.7 && cx < -80.7 && cy > 30.3 && cy < 35.1;
+        cands.push({title: it.title, pub: it.owner, url: u, count: cnt.count, f, bbox: [e.xmin, e.ymin, e.xmax, e.ymax], edited: info.editingInfo?.lastEditDate || it.modified, sample, inGA});
       }
     } catch (e) {}
   }));
-  cands.sort((a, b) => (!!b.sample.length - !!a.sample.length) || (!!b.f.owner - !!a.f.owner) || (b.edited - a.edited));
-  findCands = cands;
-  if (!cands.length) { box.innerHTML = `<div class="small muted">No free public parcel layer found for "${esc(raw)}". You can still load a purchased county file below.</div>`; return; }
-  box.innerHTML = cands.slice(0, 8).map((c, i) => `<div class="camrow" style="cursor:default;padding:9px 10px;align-items:flex-start"><div class="grow">
+  // Georgia only (there are Grady Counties in other states too); fall back to anything if Georgia has none.
+  const ga = cands.filter(c => c.inGA), pool = ga.length ? ga : cands;
+  pool.sort((a, b) => (!!b.sample.length - !!a.sample.length) || (!!b.f.owner - !!a.f.owner) || (b.edited - a.edited));
+  findCands = pool;
+  if (!pool.length) { box.innerHTML = `<div class="small muted">No free public parcel layer found for "${esc(raw)}". You can still load a purchased county file below.</div>`; return; }
+  box.innerHTML = (ga.length ? '' : '<div class="small warn">Nothing found in Georgia. These are from other states:</div>') + pool.slice(0, 8).map((c, i) => `<div class="camrow" style="cursor:default;padding:9px 10px;align-items:flex-start"><div class="grow">
       <div class="nm">${esc(c.title)}</div><div class="small muted">by ${esc(c.pub)} · ${c.count.toLocaleString()} parcels${c.edited ? ' · updated ' + new Date(c.edited).toLocaleDateString([], {month: 'short', year: 'numeric'}) : ''}</div>
       <div class="small">${c.sample.length ? `<span class="good">Owner names ✓</span> <span class="muted">e.g. ${esc(c.sample[0])}</span>` : '<span class="warn">Lines only, no owner names</span>'}</div></div>
       <button class="btn sm primary" data-use="${i}">Use</button></div>`).join('') +
@@ -636,7 +651,7 @@ function buildParcelLayer() {
     style: {color: '#ffd400', weight: 2, opacity: .95, fillColor: '#ffd400', fillOpacity: .03},
     onEachFeature: (f, l) => { l.bindPopup(() => parcelPopup(f)); fileIndex.push({f, l}); }
   }).addTo(fileGroup));
-  if (S.showParcels && !map.hasLayer(parcelLayer)) parcelLayer.addTo(map);
+  syncParcelVisibility();
   const n = fileIndex.length;
   $('#parcelStatus').innerHTML = n ? `<b>${n.toLocaleString()}</b> parcels from ${S.parcelSets.map(s => esc(s.name)).join(', ')}` : 'No extra files loaded.';
   updateParcelHere();
@@ -989,20 +1004,33 @@ function renderGamePlan(ev, hours, wind, nW) {
 /* ---------- offline tiles ---------- */
 const lon2x = (lon, z) => Math.floor((lon + 180) / 360 * 2 ** z);
 const lat2y = (lat, z) => Math.floor((1 - Math.log(Math.tan(lat * rad) + 1 / Math.cos(lat * rad)) / Math.PI) / 2 * 2 ** z);
-function tileList() {
-  const b = map.getBounds(), maxZ = +$('#dlMaxZ').value, minZ = Math.max(11, Math.min(Math.floor(map.getZoom()), maxZ) - 3);
-  const out = [];
-  for (const key of ['usgsImg', 'usgsTopo']) for (let z = minZ; z <= maxZ; z++) {
-    const x0 = lon2x(b.getWest(), z), x1 = lon2x(b.getEast(), z), y0 = lat2y(b.getNorth(), z), y1 = lat2y(b.getSouth(), z);
-    for (let x = x0; x <= x1; x++) for (let y = y0; y <= y1; y++) out.push(TILE[key].replace('{z}', z).replace('{x}', x).replace('{y}', y));
+const clampLat = v => Math.max(-85, Math.min(85, v)), clampLon = v => Math.max(-180, Math.min(179.9999, v));
+// Tile ranges for the view. Counted with arithmetic so a zoomed-out view never builds a giant list.
+function tileRanges() {
+  const b = map.getBounds(), maxZ = +$('#dlMaxZ').value, minZ = Math.max(11, Math.min(Math.floor(map.getZoom()), maxZ) - 3), out = [];
+  for (let z = minZ; z <= maxZ; z++) {
+    const x0 = lon2x(clampLon(b.getWest()), z), x1 = lon2x(clampLon(b.getEast()), z), y0 = lat2y(clampLat(b.getNorth()), z), y1 = lat2y(clampLat(b.getSouth()), z);
+    out.push({z, x0, x1, y0, y1, n: (x1 - x0 + 1) * (y1 - y0 + 1)});
   }
   return out;
 }
-function updateDlEstimate() { const el = $('#dlEstimate'); if (!el) return; const n = tileList().length; el.innerHTML = `${n.toLocaleString()} tiles, about ${Math.max(1, Math.round(n * 0.02))} MB` + (n > 6000 ? ' <span class="warn">(too many, zoom in on the map)</span>' : ''); }
+const TILE_CAP = 6000;
+const tileCount = () => 2 * tileRanges().reduce((a, r) => a + r.n, 0);
+function tileList() {
+  if (tileCount() > TILE_CAP) return null;
+  const out = [];
+  for (const key of ['usgsImg', 'usgsTopo']) for (const r of tileRanges())
+    for (let x = r.x0; x <= r.x1; x++) for (let y = r.y0; y <= r.y1; y++) out.push(TILE[key].replace('{z}', r.z).replace('{x}', x).replace('{y}', y));
+  return out;
+}
+function updateDlEstimate() {
+  const el = $('#dlEstimate'); if (!el) return; const n = tileCount();
+  el.innerHTML = n > TILE_CAP ? '<span class="warn">Area too big. Zoom the map in to your property first.</span>' : `${n.toLocaleString()} tiles, about ${Math.max(1, Math.round(n * 0.02))} MB`;
+}
 $('#dlMaxZ').onchange = updateDlEstimate;
 $('#bDownload').onclick = async () => {
   if (!navigator.serviceWorker?.controller) { $('#dlMsg').innerHTML = '<span class="warn">Offline saving needs the app opened from its web address. Reload once after the first visit.</span>'; return; }
-  const urls = tileList(); if (urls.length > 6000) { toast('Too big. Zoom the map in a bit.'); return; }
+  const urls = tileList(); if (!urls) { toast('Too big. Zoom the map in to your property first.'); return; }
   try { await navigator.storage?.persist?.(); } catch (e) {}
   const prog = $('#dlProg'); prog.style.display = 'block'; prog.max = urls.length; prog.value = 0; let done = 0, fail = 0; const q = urls.slice();
   $('#bDownload').disabled = true;
@@ -1057,7 +1085,7 @@ $$('#nav button').forEach(b => b.onclick = () => { if (b.dataset.page === 'cams'
 $('#bLayers').onclick = e => { e.stopPropagation(); endDrop(); const m = $('#layerMenu'); m.style.display = m.style.display === 'block' ? 'none' : 'block'; };
 $$('#baseSeg button').forEach(b => b.onclick = () => setBase(b.dataset.base));
 $('#chkParcels').checked = S.showParcels; $('#chkCone').checked = S.showCone; $('#chkLabels').checked = S.showLabels; $('#coneLen').value = String(S.coneLen);
-$('#chkParcels').onchange = e => { S.showParcels = e.target.checked; ls.set('showParcels', S.showParcels); S.showParcels ? parcelLayer.addTo(map) : map.removeLayer(parcelLayer); loadLiveParcels(); zoomHint(); };
+$('#chkParcels').onchange = e => { S.showParcels = e.target.checked; ls.set('showParcels', S.showParcels); syncParcelVisibility(); loadLiveParcels(); zoomHint(); };
 $('#chkCone').onchange = e => { S.showCone = e.target.checked; ls.set('showCone', S.showCone); drawCone(); };
 $('#chkLabels').onchange = e => { S.showLabels = e.target.checked; ls.set('showLabels', S.showLabels); map.fire('zoomend'); };
 $('#coneLen').onchange = e => { S.coneLen = +e.target.value; ls.set('coneLen', S.coneLen); drawCone(); };
